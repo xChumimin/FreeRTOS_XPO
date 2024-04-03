@@ -8,10 +8,15 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 #include "driver/adc.h"
+#include "esp_timer.h"
+
+/* Interruption Flag */
+#define ESP_INTR_FLAG_DEFAULT 0
+int64_t DEBOUNCE_DELAY = 50000;
 
 /* Gpio definitions*/
 #define BLINK_GPIO 1
-#define BUTTON_GPIO 39
+#define GPIO_INPUT_PIN_SEL 39
 adc1_channel_t ADC_channel = ADC1_CHANNEL_3 ;
 
 /* Led and Adc task frequency */
@@ -25,7 +30,6 @@ QueueHandle_t xState_Mailbox;
 static const char *Init_Tag = "Initialization";
 static const char *State1_Tag = "State1";
 static const char *State2_Tag = "State2";
-static const char *State3_Tag = "State3";
 static const char *Error_Tag = "Error";
 
 /* Initialization Functions */
@@ -60,20 +64,6 @@ static void initialize_adc(void)
 	}
 }
 
-static void initialize_button(void)
-{
-	esp_err_t error_indicator;
-	/* set gpio in default state and which mode */
-	 gpio_reset_pin(BUTTON_GPIO);
-	 error_indicator =  gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-	 if (error_indicator == ESP_OK ) {
-	 		ESP_LOGI(Init_Tag, "Button initialization was successful");
-	 	} else
-	 	{
-	 		ESP_LOGE(Error_Tag, "Error initializing the Button GPIO, the error code is: %d", error_indicator);
-	 	}
-}
-
 static void initialize_mailbox(void)
 {
 	/* Create mailbox and fill it with the initial state */
@@ -86,6 +76,57 @@ static void initialize_mailbox(void)
 	 	{
 	 		ESP_LOGI(Init_Tag, "Mailbox initialization was successful");
 	 	}
+}
+
+/* Interruption handler */
+static void IRAM_ATTR isr_handler(void* arg)
+{
+	int counter;
+	static int64_t  last_interruption_time = 0;
+	int64_t  interruption_time;
+	interruption_time = esp_timer_get_time() ;
+	if ((interruption_time - last_interruption_time) > DEBOUNCE_DELAY){
+	xQueuePeekFromISR(xState_Mailbox, &counter); /* Reads state  */
+	counter += 1 ;
+	if( counter >= 3 )
+	{
+		counter = 0 ;
+	}
+	xQueueOverwriteFromISR(xState_Mailbox, &counter, NULL);
+	last_interruption_time = interruption_time;
+	}
+}
+
+static void initialize_interrupt_gpio(void)
+{
+	esp_err_t error_indicator;
+	gpio_config_t io_conf = {};
+    //interrupt of rising edge
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    //bit mask of the pins, use GPIO4/5 here
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+    //set as input mode
+    io_conf.mode = GPIO_MODE_INPUT;
+    //enable pull-up mode
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&io_conf);
+
+    //change gpio interrupt type for one pin
+    error_indicator = gpio_set_intr_type(GPIO_INPUT_PIN_SEL, GPIO_INTR_NEGEDGE);
+
+    //install gpio isr service
+    error_indicator = error_indicator | gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+
+    //hook isr handler for specific gpio pin
+    error_indicator = error_indicator | gpio_isr_handler_add(GPIO_INPUT_PIN_SEL, isr_handler, NULL);
+
+	if (error_indicator == ESP_OK ) {
+		ESP_LOGI(Init_Tag, "Gpio Interrupt initialization was successful");
+	} else
+	{
+		ESP_LOGE(Error_Tag, "Error initializing the Gpio for interrupt");
+	}
 }
 
 /* Tasks */
@@ -122,40 +163,15 @@ void vTask2( void * pvParameters )
 	}
 }
 
-void vTask3( void * pvParameters )
-{
-	int last_button_state = 0 ;
-	int button_state = 0 ;
-	int counter = 0 ; /* Counter of button presses, it is the state of the system */
-
-	while(1)
-		{
-		button_state = gpio_get_level(BUTTON_GPIO); /* If a button press exist the counter rises */
-		if((button_state == 1) && (last_button_state == 0))
-		{
-			counter += 1 ;
-			if( counter >= 3 )
-			{
-				counter = 0 ;
-			}
-			xQueueOverwrite(xState_Mailbox, &counter);
-			ESP_LOGI(State3_Tag, "Button Pressed ! Counter:  %d",counter );
-		}
-		last_button_state = button_state ;
-		vTaskDelay(10 / portTICK_PERIOD_MS); /* Task Frequency*/
-		}
-}
-
 /* Main */
 void app_main(void)
 {
 	/* Initialization */
+	initialize_interrupt_gpio();
 	initialize_mailbox();
 	initialize_led();
 	initialize_adc();
-	initialize_button();
 	/* Tasks Creation */
 	xTaskCreatePinnedToCore( &vTask1, "Led_Blinking", 5000, NULL, 1, NULL , 0);
 	xTaskCreatePinnedToCore( &vTask2, "Adc_Reading", 5000, NULL, 1, NULL , 0);
-	xTaskCreatePinnedToCore( &vTask3, "Button", 5000, NULL, 1, NULL , 0);
 }
